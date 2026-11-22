@@ -21,7 +21,7 @@
 
 struct opts {
     int multi;
-    int log;
+    bool log;
 };
 
 #define OPT_BASE_STRUCT struct opts
@@ -42,6 +42,7 @@ struct priv {
 
     bool eof_pending;
     bool logged;
+    int out_count;
 };
 
 static void clear_queue(struct mp_filter *f)
@@ -60,12 +61,23 @@ static void reset(struct mp_filter *f)
 
     clear_queue(f);
     p->eof_pending = false;
+    p->logged = false;
+    p->out_count = 0;
     mp_image_unrefp(&p->prev);
 }
 
 static void destroy(struct mp_filter *f)
 {
     reset(f);
+}
+
+static void write_video(struct mp_filter *f, struct mp_image *img)
+{
+    struct priv *p = f->priv;
+
+    if (p->opts->log)
+        MP_INFO(f, "playkit: out #%d pts=%.6f\n", ++p->out_count, img->pts);
+    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, img));
 }
 
 static void process(struct mp_filter *f)
@@ -86,7 +98,7 @@ static void process(struct mp_filter *f)
             p->queue_pos = 0;
             p->queue_len = 0;
         }
-        mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, img));
+        write_video(f, img);
         return;
     }
 
@@ -114,7 +126,7 @@ static void process(struct mp_filter *f)
             struct mp_image *img = p->queue[p->queue_pos];
             p->queue[p->queue_pos] = NULL;
             p->queue_pos++;
-            mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, img));
+            write_video(f, img);
         } else {
             mp_pin_in_write(out, frame);
         }
@@ -143,13 +155,17 @@ static void process(struct mp_filter *f)
     /* First frame: pass it through and use it as the previous frame. */
     if (!p->prev) {
         p->prev = mp_image_new_ref(cur);
-        mp_pin_in_write(out, frame);
+        write_video(f, cur);
         return;
     }
 
     double step = 0.0;
     if (cur->pts != MP_NOPTS_VALUE && p->prev->pts != MP_NOPTS_VALUE)
         step = (cur->pts - p->prev->pts) / multi;
+
+    if (p->opts->log)
+        MP_INFO(f, "playkit: in pts=%.6f prev=%.6f multi=%d step=%.6f\n",
+                cur->pts, p->prev->pts, multi, step);
 
     /*
      * Queue the intermediate frames followed by the current frame.  The
@@ -174,7 +190,7 @@ static void process(struct mp_filter *f)
     struct mp_image *first = p->queue[0];
     p->queue[0] = NULL;
     p->queue_pos = 1;
-    mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, first));
+    write_video(f, first);
 }
 
 static const struct mp_filter_info vf_playkit_filter = {
