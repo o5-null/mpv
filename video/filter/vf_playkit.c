@@ -18,10 +18,12 @@
 #include "options/m_option.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
+#include "video/sws_utils.h"
 
 struct opts {
     int multi;
     bool log;
+    int outfmt;
 };
 
 #define OPT_BASE_STRUCT struct opts
@@ -29,11 +31,13 @@ struct opts {
 static const m_option_t vf_opts_fields[] = {
     {"multi", OPT_INT(multi)},
     {"log", OPT_BOOL(log)},
+    {"outfmt", OPT_IMAGEFORMAT(outfmt)},
     {0}
 };
 
 struct priv {
     struct opts *opts;
+    struct mp_sws_context *sws;
 
     struct mp_image *prev;
     struct mp_image *queue[6];
@@ -78,6 +82,54 @@ static void write_video(struct mp_filter *f, struct mp_image *img)
     if (p->opts->log)
         MP_INFO(f, "playkit: out #%d pts=%.6f\n", ++p->out_count, img->pts);
     mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, img));
+}
+
+/*
+ * Convert a software frame to the requested output format before it is
+ * duplicated. Hardware frames are passed through unchanged: turning a D3D11
+ * texture into another format needs a video processor, which belongs to the
+ * future D3D11/D3D12 bridge rather than to the multiplier itself.
+ */
+static struct mp_image *convert_outfmt(struct mp_filter *f, struct mp_image *src)
+{
+    struct priv *p = f->priv;
+    const int outfmt = p->opts->outfmt;
+
+    if (!outfmt || src->imgfmt == outfmt)
+        return src;
+
+    if (src->imgfmt == IMGFMT_D3D11) {
+        MP_ERR(f, "playkit: outfmt=%s cannot convert hardware %s; "
+                  "put a format filter after playkit instead\n",
+               mp_imgfmt_to_name(outfmt),
+               src->params.hw_subfmt ? mp_imgfmt_to_name(src->params.hw_subfmt) : "d3d11");
+        return NULL;
+    }
+
+    struct mp_image *dst = mp_image_alloc(outfmt, src->w, src->h);
+    if (!dst)
+        return NULL;
+
+    if (p->opts->log) {
+        MP_INFO(f, "playkit: convert %s -> %s\n",
+                mp_imgfmt_to_name(src->imgfmt), mp_imgfmt_to_name(outfmt));
+    }
+
+    dst->params = src->params;
+    dst->params.imgfmt = outfmt;
+    dst->params.hw_subfmt = 0;
+    mp_image_params_guess_csp(&dst->params);
+    mp_image_copy_attributes(dst, src);
+
+    if (mp_sws_scale(p->sws, dst, src) < 0) {
+        MP_ERR(f, "playkit: cannot convert %s to %s\n",
+               mp_imgfmt_to_name(src->imgfmt), mp_imgfmt_to_name(outfmt));
+        mp_image_unrefp(&dst);
+        return NULL;
+    }
+
+    mp_image_unrefp(&src);
+    return dst;
 }
 
 static void process(struct mp_filter *f)
@@ -152,6 +204,16 @@ static void process(struct mp_filter *f)
         p->logged = true;
     }
 
+    if (p->opts->outfmt && cur->imgfmt != p->opts->outfmt) {
+        struct mp_image *conv = convert_outfmt(f, cur);
+        if (!conv) {
+            mp_frame_unref(&frame);
+            mp_filter_internal_mark_failed(f);
+            return;
+        }
+        cur = conv;
+    }
+
     /* First frame: pass it through and use it as the previous frame. */
     if (!p->prev) {
         p->prev = mp_image_new_ref(cur);
@@ -221,6 +283,16 @@ static struct mp_filter *vf_playkit_create(struct mp_filter *parent,
         p->opts->multi = 6;
     p->queue_len = 0;
     p->queue_pos = 0;
+    p->eof_pending = false;
+
+    if (p->opts->outfmt) {
+        p->sws = mp_sws_alloc(p);
+        if (!p->sws) {
+            talloc_free(f);
+            return NULL;
+        }
+        mp_sws_enable_cmdline_opts(p->sws, f->global);
+    }
 
     return f;
 }
