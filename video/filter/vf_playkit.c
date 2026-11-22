@@ -8,7 +8,6 @@
  */
 
 #include <math.h>
-#include <talloc.h>
 
 #include "common/common.h"
 #include "common/msg.h"
@@ -41,6 +40,7 @@ struct priv {
     int queue_len;
     int queue_pos;
 
+    bool eof_pending;
     bool logged;
 };
 
@@ -59,6 +59,7 @@ static void reset(struct mp_filter *f)
     struct priv *p = f->priv;
 
     clear_queue(f);
+    p->eof_pending = false;
     mp_image_unrefp(&p->prev);
 }
 
@@ -89,6 +90,13 @@ static void process(struct mp_filter *f)
         return;
     }
 
+    /* The queue is empty; a pending EOF can be forwarded now. */
+    if (p->eof_pending) {
+        p->eof_pending = false;
+        mp_pin_in_write(out, MP_EOF_FRAME);
+        return;
+    }
+
     if (!mp_pin_out_request_data(in))
         return;
 
@@ -97,7 +105,19 @@ static void process(struct mp_filter *f)
         return;
 
     if (mp_frame_is_signaling(frame)) {
-        mp_pin_in_write(out, frame);
+        if (p->queue_pos < p->queue_len) {
+            /* Keep the queued frames; write the first one now so the filter
+             * keeps being scheduled, then forward EOF after the queue drains. */
+            p->eof_pending = true;
+            mp_frame_unref(&frame);
+
+            struct mp_image *img = p->queue[p->queue_pos];
+            p->queue[p->queue_pos] = NULL;
+            p->queue_pos++;
+            mp_pin_in_write(out, MAKE_FRAME(MP_FRAME_VIDEO, img));
+        } else {
+            mp_pin_in_write(out, frame);
+        }
         return;
     }
 
