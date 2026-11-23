@@ -1,0 +1,134 @@
+name: playkit-windows
+
+# Builds *our own* mpv (this fork, with vf_playkit + vf vapoursynth) on Windows.
+#
+# Difference from shinchiro's mpv-winbuild: that ships a fully static binary,
+# ours is the regular MSYS2 CLANG64 dynamic build - so the runtime DLL closure
+# (ffmpeg, libplacebo, vapoursynth, python, ...) is flattened next to mpv.exe by
+# scripts/package_windows.py and travels inside the zip. Result is still a
+# self-contained folder: unzip anywhere and run mpv.exe, no MSYS2 required.
+#
+# Trigger: manual run, or push a tag like playkit-2026.11.23 (creates a release).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the archive name (default: today, YYYY.MM.DD)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "playkit-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (CLANG64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            base-devel
+            git
+
+      # Pulling the packaged mpv drags in the complete build dependency set
+      # (ffmpeg, libplacebo, shaderc, spirv-cross, libass, luajit, zimg, ...)
+      # with versions that are known to link together, instead of guessing a
+      # hand-written package list. vapoursynth is added explicitly: vf_playkit
+      # cannot frame-generate without the vapoursynth bridge.
+      - name: Install build dependencies
+        run: >-
+          pacman -S --needed --noconfirm
+          mingw-w64-clang-x86_64-mpv
+          mingw-w64-clang-x86_64-vapoursynth
+          mingw-w64-clang-x86_64-clang
+          mingw-w64-clang-x86_64-pkgconf
+          meson
+          ninja
+
+      - name: Show toolchain versions
+        run: |
+          cc --version | head -1
+          meson --version
+          ninja --version
+          pacman -Q mingw-w64-clang-x86_64-vapoursynth
+
+      # Same options as E:\code\dlssg-vfi\build-mpv.sh. vapoursynth is pinned to
+      # 'enabled' so a missing/broken package fails the build instead of
+      # silently producing an mpv without vf vapoursynth.
+      - name: Configure
+        run: |
+          meson setup build-msys \
+            --prefix=/clang64 \
+            -Dlibmpv=true \
+            -Dd3d11=enabled \
+            -Dvulkan=enabled \
+            -Dshaderc=enabled \
+            -Dvapoursynth=enabled
+
+      - name: Compile
+        run: meson compile -C build-msys
+
+      - name: Smoke test (vf vapoursynth present)
+        run: |
+          ./build-msys/mpv.com --no-config --vf=help | grep -q vapoursynth
+          ./build-msys/mpv.com --version
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}" -replace '^playkit-', ''
+          } elseif ("${{ inputs.version }}") {
+            $version = "${{ inputs.version }}"
+          } else {
+            $version = (Get-Date).ToString("yyyy.MM.dd")
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist/mpv-x86_64-playkit-${{ steps.ver.outputs.version }}.zip"
+          python scripts/package_windows.py `
+            --build-dir build-msys `
+            --msys-bin C:\msys64\clang64\bin `
+            --out $out `
+            --version "${{ steps.ver.outputs.version }}"
+          Get-Item $out | Format-List Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-x86_64-playkit-${{ steps.ver.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/playkit-')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            Self-built mpv (this fork) with vf_playkit and vf vapoursynth.
+
+            Unlike shinchiro's static mpv-winbuild, this is the MSYS2 CLANG64
+            dynamic build with its DLL closure flattened into the archive root:
+            unzip and run `mpv.exe` / `mpv.com`, no MSYS2 installation needed.
