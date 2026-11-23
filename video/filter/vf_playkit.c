@@ -1,10 +1,13 @@
 /*
- * PlayKit frame multiplier (pass-through prototype)
+ * PlayKit frame multiplier (D3D11 zero-copy DLSS-G)
  *
- * For every input frame pair, emit `multi` output frames.  The prototype
- * duplicates the current frame and assigns evenly spaced PTS values.  It is
- * meant to validate D3D11 frame handling, PTS interpolation, queueing and EOF
- * before the real DLSS-G / aji zero-copy path is plugged in.
+ * For every input frame pair, emit `multi` output frames.  The generated
+ * frames come from the vdlssg bridge: both input textures and every output
+ * texture are D3D11 shared NT handles that the D3D12 side opens directly, so
+ * no plane is copied through the CPU.  When the bridge is unavailable (no
+ * vdlssg.dll, no D3D11 hwdec, unsupported format) the filter degrades to
+ * duplicating the current frame, which still validates PTS interpolation,
+ * queueing and EOF handling.
  */
 
 #include <math.h>
@@ -183,6 +186,75 @@ static ID3D11Texture2D *pk_create_tex(ID3D11Device *dev, int w, int h,
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &desc, NULL, &tex)))
         return NULL;
     return tex;
+}
+
+/* 便携包一般从自己的目录启动，但文件关联、快捷方式（自带"起始位置"）会让
+ * mpv 的工作目录变成别处；Win32 按工作目录解析相对路径，包内的 DLL 就会
+ * 找不到。下面两个辅助函数在相对路径按工作目录不存在时，回退到 mpv.exe
+ * 所在目录再试一次。 */
+static bool pk_is_absolute(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    if (path[0] == '/' || path[0] == '\\')
+        return true;
+    return path[1] == ':' &&
+           ((path[0] >= 'A' && path[0] <= 'Z') ||
+            (path[0] >= 'a' && path[0] <= 'z'));
+}
+
+static bool pk_exe_relative_exists(const char *rel, char *out, size_t out_size)
+{
+    wchar_t exe[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!len || len >= MAX_PATH)
+        return false;
+
+    wchar_t *name = wcsrchr(exe, L'\\');
+    if (!name)
+        return false;
+    *name = L'\0';
+
+    wchar_t rel_w[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, rel, -1, rel_w, MAX_PATH))
+        return false;
+    for (wchar_t *q = rel_w; *q; q++) {
+        if (*q == L'/')
+            *q = L'\\';
+    }
+
+    wchar_t full[MAX_PATH];
+    int n = swprintf(full, MAX_PATH, L"%s\\%s", exe, rel_w);
+    if (n <= 0 || n >= MAX_PATH)
+        return false;
+    if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
+    return WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)out_size,
+                               NULL, NULL) > 0;
+}
+
+/* 绝对路径原样保留（NGX 要绝对路径）；相对路径先按工作目录，再按 exe 目录。 */
+static void pk_abs_path(const char *path, char *out, size_t out_size)
+{
+    if (pk_is_absolute(path)) {
+        snprintf(out, out_size, "%s", path);
+        return;
+    }
+
+    char cwd[MAX_PATH];
+    if (GetFullPathNameA(path, MAX_PATH, cwd, NULL) &&
+        GetFileAttributesA(cwd) != INVALID_FILE_ATTRIBUTES) {
+        snprintf(out, out_size, "%s", cwd);
+        return;
+    }
+
+    if (pk_exe_relative_exists(path, out, out_size))
+        return;
+
+    if (!GetFullPathNameA(path, MAX_PATH, cwd, NULL))
+        cwd[0] = '\0';
+    snprintf(out, out_size, "%s", cwd);
 }
 
 static void pk_bridge_destroy(struct pk_bridge *b)
@@ -410,11 +482,14 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
     /* NGX resolves the runtime through the paths passed to Init.  Relative
      * paths make it load the system 2x runtime instead of the bundled one,
      * so pin both the bridge DLL and the proxy directory to absolute paths
-     * before anything is loaded. */
+     * before anything is loaded.  Relative options resolve against the
+     * working directory first and the mpv.exe directory second, so the
+     * portable layout works even when the player is started elsewhere. */
     char abs_dll[MAX_PATH];
     char abs_proxy_dir[MAX_PATH];
-    if (!GetFullPathNameA(dll_path, MAX_PATH, abs_dll, NULL) ||
-        !GetFullPathNameA(proxy_dir, MAX_PATH, abs_proxy_dir, NULL)) {
+    pk_abs_path(dll_path, abs_dll, sizeof(abs_dll));
+    pk_abs_path(proxy_dir, abs_proxy_dir, sizeof(abs_proxy_dir));
+    if (!abs_dll[0] || !abs_proxy_dir[0]) {
         MP_ERR(f, "playkit: cannot resolve bridge paths (error %lu)\n",
                GetLastError());
         goto fail;
@@ -1032,7 +1107,7 @@ static struct mp_filter *vf_playkit_create(struct mp_filter *parent,
 
 const struct mp_user_filter_entry vf_playkit = {
     .desc = {
-        .description = "PlayKit frame multiplier (pass-through prototype)",
+        .description = "PlayKit frame multiplier (D3D11 zero-copy DLSS-G)",
         .name = "playkit",
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
