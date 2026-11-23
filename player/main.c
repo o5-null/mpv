@@ -23,6 +23,10 @@
 #include <string.h>
 #include <locale.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "config.h"
 
 #include <libplacebo/config.h>
@@ -452,6 +456,38 @@ int mp_initialize(struct MPContext *mpctx, char **options)
     return 0;
 }
 
+#ifdef _WIN32
+// The DLSS-G runtime is picked when NGX initialises, and the first D3D11
+// device created by the VO is already too late: the system nvngx_dlssg.dll
+// is resident by then and the dlssg_for_sm86 proxy classifies it as a
+// generation-A game. Load the proxy after mpv has finished its own startup
+// (so its imports are bound to the system version.dll) and before playback
+// creates the VO device.
+static void playkit_load_proxy(void)
+{
+    wchar_t path[MAX_PATH];
+    DWORD len = GetEnvironmentVariableW(L"PLAYKIT_PROXY", path, MAX_PATH);
+    if (!len || len >= MAX_PATH)
+        return;
+
+    // Bind the real version.dll first; otherwise the proxy's own imports of
+    // version.dll can resolve back to itself and fail with 0xc0000139.
+    HMODULE sys_dlssg = GetModuleHandleW(L"nvngx_dlssg.dll");
+    LoadLibraryW(L"version.dll");
+    HMODULE sys_version = GetModuleHandleW(L"version.dll");
+    HMODULE mod = LoadLibraryW(path);
+    if (!mod) {
+        fwprintf(stderr, L"[playkit] cannot load proxy %ls (error %lu)\n",
+                 path, GetLastError());
+    } else {
+        fwprintf(stderr,
+                 L"[playkit] proxy loaded: %ls (sys_dlssg=%p sys_version=%p proxy=%p)\n",
+                 path, (void *)sys_dlssg, (void *)sys_version, (void *)mod);
+    }
+    fflush(stderr);
+}
+#endif
+
 int mpv_main(int argc, char *argv[])
 {
     struct MPContext *mpctx = mp_create();
@@ -462,6 +498,10 @@ int mpv_main(int argc, char *argv[])
 
     char **options = argv && argv[0] ? argv + 1 : NULL; // skips program name
     int r = mp_initialize(mpctx, options);
+#ifdef _WIN32
+    if (r == 0)
+        playkit_load_proxy();
+#endif
     if (r == 0)
         mp_play_files(mpctx);
 

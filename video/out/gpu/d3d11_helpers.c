@@ -356,6 +356,23 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
     IDXGIFactory1 *factory;
     IDXGIAdapter1 *picked_adapter = NULL;
 
+    // Allow "#<index>" to disambiguate identical adapter descriptions.
+    int requested_index = -1;
+    if (requested_adapter_name.len > 1 && requested_adapter_name.start[0] == '#') {
+        int index = 0;
+        bool valid = true;
+        for (int i = 1; i < requested_adapter_name.len; i++) {
+            char c = requested_adapter_name.start[i];
+            if (c < '0' || c > '9') {
+                valid = false;
+                break;
+            }
+            index = index * 10 + (c - '0');
+        }
+        if (valid && index < 64)
+            requested_index = index;
+    }
+
     PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = get_CreateDXGIFactory1();
     if (!pCreateDXGIFactory1) {
         mp_fatal(log, "Failed to load CreateDXGIFactory1 function.\n");
@@ -399,9 +416,10 @@ IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
                                   adapter_description);
         }
 
-        if (requested_adapter_name.len &&
-            bstr_case_startswith(bstr0(adapter_description),
-                                 requested_adapter_name))
+        if ((requested_index >= 0 && (int)adapter_num == requested_index) ||
+            (requested_index < 0 && requested_adapter_name.len &&
+             bstr_case_startswith(bstr0(adapter_description),
+                                  requested_adapter_name)))
         {
             picked_adapter = adapter;
         }
@@ -431,6 +449,22 @@ int mp_dxgi_validate_adapter(struct mp_log *log,
 
     if (bstr_equals0(param, "")) {
         return 0;
+    }
+
+    // "#<index>" is resolved by mp_get_dxgi_adapter(); accept it here.
+    if (param.len > 1 && param.start[0] == '#') {
+        int index = 0;
+        bool valid = true;
+        for (int i = 1; i < param.len; i++) {
+            char c = param.start[i];
+            if (c < '0' || c > '9') {
+                valid = false;
+                break;
+            }
+            index = index * 10 + (c - '0');
+        }
+        if (valid && index < 64)
+            return 1;
     }
 
     adapter_matched = mp_dxgi_list_or_verify_adapters(log,
