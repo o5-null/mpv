@@ -106,7 +106,8 @@ jobs:
         shell: pwsh
         run: |
           $out = "dist/mpv-x86_64-playkit-${{ steps.ver.outputs.version }}.zip"
-          python scripts/package_windows.py `
+          # 用 CLANG64 的 python，别落到 runner 自带的（脚本本身是纯标准库，但路径更可控）
+          C:\msys64\clang64\bin\python.exe scripts/package_windows.py `
             --build-dir build-msys `
             --msys-bin C:\msys64\clang64\bin `
             --out $out `
