@@ -113,7 +113,7 @@ def find_objdump(msys_bin: Path) -> Path:
         if candidate.is_file():
             return candidate
     raise SystemExit(
-        f"error: objdump.exe not found (looked in {msys_bin} and the default MSYS2 path)"
+        f"error: objdump.exe not found (looked in {msys_bin} and the default MSYS2 path)",
     )
 
 
@@ -186,7 +186,7 @@ class Resolver:
 
 
 def build_closure(
-    seeds: list[Path], resolver: Resolver, objdump: Path
+    seeds: list[Path], resolver: Resolver, objdump: Path,
 ) -> tuple[dict[str, Path], list[str]]:
     """Walk the import graph breadth-first until it stops growing.
 
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     script_root = Path(__file__).resolve().parents[1]
 
     parser = argparse.ArgumentParser(
-        description="Package the local CLANG64 mpv build into a flat zip."
+        description="Package the local CLANG64 mpv build into a flat zip.",
     )
     parser.add_argument(
         "--build-dir",
@@ -246,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", required=True, help="output .zip path")
     parser.add_argument(
-        "--version", default="", help="version string, used for the archive comment"
+        "--version", default="", help="version string, used for the archive comment",
     )
     args = parser.parse_args(argv)
 
@@ -308,7 +308,9 @@ def main(argv: list[str] | None = None) -> int:
         total = 0
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             if args.version:
-                zf.comment = f"mpv-playkit {args.version} (self-built, dynamic deps bundled)".encode()
+                zf.comment = (
+                    f"mpv-playkit {args.version} (self-built, dynamic deps bundled)".encode()
+                )
             for name, _source in entries:
                 staged = staging / name
                 total += staged.stat().st_size
@@ -323,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     log(f"zip size  : {zip_size:,} bytes ({zip_size / (1024 * 1024):.1f} MiB)")
     log(f"archive   : {out}")
     if skipped:
-        log(f"skipped {len(skipped)} unresolved/unwanted dependenc{'y' if len(skipped) == 1 else 'ies'}:")
+        suffix = "y" if len(skipped) == 1 else "ies"
+        log(f"skipped {len(skipped)} unresolved/unwanted dependenc{suffix}:")
         for name in skipped:
             log(f"  - {name}")
     else:
