@@ -104,17 +104,22 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "version=$version"
 
+      # 在 MSYS2 外壳里打包，python 自然是 CLANG64 的（pwsh 里的
+      # C:\msys64\clang64\bin\python.exe 在 runner 上不一定存在）。
       - name: Package
-        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          $out = "dist/mpv-x86_64-playkit-${{ steps.ver.outputs.version }}.zip"
-          # 用 CLANG64 的 python，别落到 runner 自带的（脚本本身是纯标准库，但路径更可控）
-          C:\msys64\clang64\bin\python.exe scripts/package_windows.py `
-            --build-dir build-msys `
-            --msys-bin C:\msys64\clang64\bin `
-            --out $out `
-            --version "${{ steps.ver.outputs.version }}"
-          Get-Item $out | Format-List Name,Length
+          mkdir -p dist
+          python -V
+          # CI 的 MSYS2 根目录不是 C:\msys64（setup-msys2 装在 D:\a\_temp\msys64），
+          # 所以 bin 目录用 cygpath 现场换算，打包脚本要的是 Windows 路径。
+          python scripts/package_windows.py \
+            --build-dir build-msys \
+            --msys-bin "$(cygpath -w /clang64/bin)" \
+            --out "dist/mpv-x86_64-playkit-${VERSION}.zip" \
+            --version "${VERSION}"
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
