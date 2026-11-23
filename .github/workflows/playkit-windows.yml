@@ -48,6 +48,10 @@ jobs:
       # with versions that are known to link together, instead of guessing a
       # hand-written package list. vapoursynth is added explicitly: vf_playkit
       # cannot frame-generate without the vapoursynth bridge.
+      #
+      # meson/ninja 必须用 CLANG64 版：MSYS 的 meson 由 /usr/bin/python3 执行，
+      # 在 MinGW 环境里会报 "This python3 seems to be msys/python on MSYS2 Windows"
+      # 并退出 2。（注意这里是折叠标量，别在命令中间插 #，会吞掉后半行。）
       - name: Install build dependencies
         run: >-
           pacman -S --needed --noconfirm
@@ -55,8 +59,6 @@ jobs:
           mingw-w64-clang-x86_64-vapoursynth
           mingw-w64-clang-x86_64-clang
           mingw-w64-clang-x86_64-pkgconf
-          # CLANG64 的 meson/ninja：MSYS 的 meson 会用 /usr/bin/python3，在 MinGW
-          # 环境里直接拒绝运行（"This python3 seems to be msys/python on MSYS2 Windows"）
           mingw-w64-clang-x86_64-meson
           mingw-w64-clang-x86_64-ninja
 
