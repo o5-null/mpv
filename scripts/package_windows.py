@@ -268,12 +268,13 @@ def main(argv: list[str] | None = None) -> int:
     log(f"msys bin  : {msys_bin}")
     log(f"objdump   : {objdump}")
 
-    # Seed files: the launcher pair, plus d3dcompiler_43 if MSYS2 ships it.
+    # Seed files: the launcher pair plus libmpv-2.dll (used by third-party
+    # players/frontends), and d3dcompiler_43 if MSYS2 ships it.
     seeds: list[Path] = []
-    for exe in ("mpv.exe", "mpv.com"):
+    for exe in ("mpv.exe", "mpv.com", "libmpv-2.dll"):
         path = build_dir / exe
         if not path.is_file():
-            raise SystemExit(f"error: missing {path}")
+            raise SystemExit(f"error: missing {path} (rebuild with -Dlibmpv=true)")
         seeds.append(path)
         log(f"seed      : {exe} ({path.stat().st_size:,} bytes)")
 
