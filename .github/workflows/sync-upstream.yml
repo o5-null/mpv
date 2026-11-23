@@ -1,0 +1,105 @@
+# 上游同步：每天检查一次 mpv-player/mpv 的 master，有新提交就把本 fork 的补丁
+# rebase 到新上游之上，再 force-with-lease 推回 master。
+#
+# 用 rebase 而不是 merge：mpv 的 commit-msg lint 禁止 merge commit。
+# 用 GITHUB_TOKEN 推回不会触发 playkit-windows（GitHub 会拦掉由 token 触发的
+# workflow 运行），所以最后显式 dispatch 一次构建。
+name: sync-upstream
+
+on:
+  schedule:
+    # 每天 UTC 05:00（北京时间 13:00）
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # 把 rebase 结果推回 master
+  actions: write # gh workflow run 触发 playkit-windows
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 fork master（rebase 需要完整历史）
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: 配置 git 身份与上游远端
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/mpv-player/mpv.git
+
+      - name: 检查上游是否有新提交
+        id: check
+        run: |
+          git fetch --no-tags upstream master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "上游没有新提交，跳过"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游有新提交"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 把本 fork 的补丁 rebase 到新上游
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          # 唯一预期冲突：本 fork 删掉了 .github/workflows/build.yml，
+          # 上游还在改它。冲突时保持删除状态；其它文件冲突直接失败，留给人处理。
+          resolve_conflicts() {
+            local remaining=""
+            for f in $(git diff --name-only --diff-filter=U); do
+              case "$f" in
+                .github/workflows/build.yml | .github/workflows/fuzz.yml)
+                  git rm -q -f "$f" || true
+                  ;;
+                *)
+                  remaining="$remaining $f"
+                  ;;
+              esac
+            done
+            if [ -n "$remaining" ]; then
+              echo "::error::需要人工解决的冲突:$remaining"
+              git rebase --abort || true
+              exit 1
+            fi
+          }
+
+          if git rebase upstream/master; then
+            echo "rebase 完成"
+            exit 0
+          fi
+
+          for _ in $(seq 1 20); do
+            if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              # 补丁变成空提交（上游已合入同样改动），跳过它。
+              GIT_EDITOR=true git rebase --skip || true
+            else
+              resolve_conflicts
+              GIT_EDITOR=true git rebase --continue || true
+            fi
+            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
+              echo "rebase 完成"
+              exit 0
+            fi
+          done
+
+          echo "::error::rebase 冲突没有收敛"
+          git rebase --abort || true
+          exit 1
+
+      - name: 推回 master 并触发构建
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git log --oneline upstream/master..HEAD
+          git push --force-with-lease origin master
+          gh workflow run playkit-windows.yml --ref master
