@@ -8,7 +8,10 @@ name: playkit-windows
 # scripts/package_windows.py and travels inside the zip. Result is still a
 # self-contained folder: unzip anywhere and run mpv.exe, no MSYS2 required.
 #
-# Trigger: manual run, or push a tag like playkit-2026.11.23 (creates a release).
+# Trigger:
+#   - manual run
+#   - any push to master: auto build, artifact only (no release)
+#   - push a tag like playkit-2026.11.23: build + release
 
 on:
   workflow_dispatch:
@@ -18,11 +21,18 @@ on:
         required: false
         default: ""
   push:
+    branches:
+      - master
     tags:
       - "playkit-*"
 
 permissions:
   contents: write
+
+# 连续推多个 commit 时只保留最后一次构建，避免排队等 5 分钟以上。
+concurrency:
+  group: playkit-windows-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
