@@ -30,6 +30,7 @@
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
+#include "video/csputils.h"
 #include "video/sws_utils.h"
 
 static double pk_now_ms(void)
@@ -568,6 +569,44 @@ static bool pk_wait(struct mp_filter *f)
 
 static uint64_t pk_hash_texture(struct pk_bridge *b, ID3D11Texture2D *tex,
                                 UINT sub);
+static void pk_luma_stat(struct mp_filter *f, ID3D11Texture2D *tex, UINT sub,
+                         int index, const char *what);
+
+// The video processor is never told what the pixels mean, so it falls back to its
+// defaults: full range RGB in, BT.601 full range YCbCr out.  The generated frames are
+// then tagged with the source parameters (BT.709 limited), which makes the VO expand
+// the range a second time - black crush and clipped whites on every generated frame.
+// Match the output to the parameters the frame carries instead.
+static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
+{
+    struct priv *p = f->priv;
+    struct pk_bridge *b = p->bridge;
+    if (!b || !b->video_ctx || !b->vp)
+        return;
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {0};
+    in.Usage = 0;              // playback
+    in.RGB_Range = 0;          // the engine outputs full range RGBA
+    in.YCbCr_Matrix = 1;       // BT.709 primaries
+    in.Nominal_Range = 0;      // 0-255
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {0};
+    out.Usage = 0;
+    out.RGB_Range = 0;
+    out.YCbCr_Matrix = 1;      // BT.709 unless the source says otherwise
+    out.Nominal_Range = 1;     // studio range 16-235
+    if (ref) {
+        if (ref->params.repr.sys == PL_COLOR_SYSTEM_BT_601)
+            out.YCbCr_Matrix = 0;
+        if (ref->params.repr.levels == PL_COLOR_LEVELS_FULL)
+            out.Nominal_Range = 0;
+    }
+
+    ID3D11VideoContext_VideoProcessorSetStreamColorSpace(b->video_ctx, b->vp, 0,
+                                                         &in);
+    ID3D11VideoContext_VideoProcessorSetOutputColorSpace(b->video_ctx, b->vp,
+                                                         &out);
+}
 
 static bool pk_generate(struct mp_filter *f, struct mp_image *prev,
                         struct mp_image *cur)
@@ -593,6 +632,10 @@ static bool pk_generate(struct mp_filter *f, struct mp_image *prev,
         return false;
     const double t1 = pk_now_ms();
 
+    if (getenv("PLAYKIT_DSTSTAT")) {
+        pk_luma_stat(f, b->in_tex[0], 0, 0, "src");
+        pk_luma_stat(f, b->in_tex[1], 0, 1, "src");
+    }
     if (p->opts->log) {
         MP_INFO(f, "playkit: in[0] hash=%016llx in[1] hash=%016llx\n",
                 (unsigned long long)pk_hash_texture(b, b->in_tex[0], 0),
@@ -663,6 +706,55 @@ static uint64_t pk_hash_texture(struct pk_bridge *b, ID3D11Texture2D *tex,
 
     ID3D11Texture2D_Release(staging);
     return hash;
+}
+
+// Diagnostic only (PLAYKIT_DSTSTAT): mean/min/max of the NV12 luma plane, read back
+// through staging so we see exactly what the VO will sample for this frame.
+static void pk_luma_stat(struct mp_filter *f, ID3D11Texture2D *tex, UINT sub,
+                         int index, const char *what)
+{
+    struct pk_bridge *b = ((struct priv *)f->priv)->bridge;
+    D3D11_TEXTURE2D_DESC d = {0};
+    ID3D11Texture2D_GetDesc(tex, &d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.ArraySize = 1;
+    sd.MipLevels = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+
+    ID3D11Texture2D *st = NULL;
+    if (FAILED(ID3D11Device_CreateTexture2D(b->dev, &sd, NULL, &st)))
+        return;
+    ID3D11DeviceContext_CopySubresourceRegion(
+        b->ctx, (ID3D11Resource *)st, 0, 0, 0, 0, (ID3D11Resource *)tex, sub,
+        NULL);
+    ID3D11DeviceContext_Flush(b->ctx);
+    pk_wait(f);
+
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(b->ctx, (ID3D11Resource *)st, 0,
+                                          D3D11_MAP_READ, 0, &map))) {
+        unsigned long long sum = 0;
+        unsigned mn = 255, mx = 0;
+        for (UINT y = 0; y < d.Height; y++) {
+            const uint8_t *row =
+                (const uint8_t *)map.pData + (size_t)y * map.RowPitch;
+            for (UINT x = 0; x < d.Width; x++) {
+                unsigned v = row[x];
+                sum += v;
+                if (v < mn)
+                    mn = v;
+                if (v > mx)
+                    mx = v;
+            }
+        }
+        MP_INFO(f, "playkit: %s[%d] sub=%u y=%.2f min=%u max=%u\n", what,
+                index, sub, (double)sum / ((double)d.Width * d.Height), mn, mx);
+        ID3D11DeviceContext_Unmap(b->ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
 }
 
 static void pk_dump_rgba(struct pk_bridge *b, ID3D11Texture2D *tex,
@@ -819,6 +911,8 @@ static struct mp_image *pk_frame(struct mp_filter *f, int index, double pts,
                 index, pt1 - pt0, pt2 - pt1, pt2 - pt0, (void *)dst,
                 (unsigned)dst_sub);
     }
+    if (getenv("PLAYKIT_DSTSTAT"))
+        pk_luma_stat(f, dst, dst_sub, index, "dst");
 
     if (p->opts->log) {
         uint64_t hash = pk_hash_texture(b, dst, dst_sub);
@@ -1012,6 +1106,7 @@ static void process(struct mp_filter *f)
                 p->bridge_failed = true;
         }
         if (p->bridge && pk_generate(f, p->prev, cur)) {
+            pk_update_colorspace(f, cur);
             for (int k = 0; k < p->bridge->out_count; k++) {
                 struct mp_image *img = pk_frame(f, k,
                     p->prev->pts + (k + 1) * step, out_fps);
