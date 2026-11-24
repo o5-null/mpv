@@ -76,6 +76,7 @@ struct priv {
 
     bool eof_pending;
     bool logged;
+    bool params_logged;
     bool bridge_failed;
     int out_count;
 
@@ -99,6 +100,7 @@ static void reset(struct mp_filter *f)
     clear_queue(f);
     p->eof_pending = false;
     p->logged = false;
+    p->params_logged = false;
     p->bridge_failed = false;
     p->out_count = 0;
     mp_image_unrefp(&p->prev);
@@ -1019,6 +1021,21 @@ static void process(struct mp_filter *f)
                     mp_frame_unref(&frame);
                     return;
                 }
+                if (!p->params_logged) {
+                    p->params_logged = true;
+                    if (getenv("PLAYKIT_TIMING"))
+                        MP_INFO(f, "playkit: params gen=[%s] src=[%s]\n",
+                                mp_image_params_to_str(&img->params),
+                                mp_image_params_to_str(&cur->params));
+                }
+                /*
+                 * Frames from the hw frame pool carry the container's unset
+                 * colour metadata, so their params differ from the decoded
+                 * source.  The VO compares params per frame and rebuilds its
+                 * render pass when they change, which cost ~10 ms every source
+                 * frame here.  Take the source params instead.
+                 */
+                img->params = cur->params;
                 p->queue[p->queue_len++] = img;
             }
             cur->nominal_fps = out_fps;
