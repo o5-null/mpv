@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_6.h>
 
 #include <libavutil/hwcontext.h>
@@ -79,6 +80,7 @@ struct priv {
     bool logged;
     bool params_logged;
     bool bridge_failed;
+    bool cs_logged;
     int out_count;
 
     struct pk_bridge *bridge;
@@ -134,6 +136,7 @@ struct pk_bridge {
     ID3D11DeviceContext *ctx;
     ID3D11VideoDevice *video_dev;
     ID3D11VideoContext *video_ctx;
+    ID3D11VideoContext1 *video_ctx1;
     ID3D11VideoProcessorEnumerator *vp_enum;
     ID3D11VideoProcessor *vp;
     ID3D11Texture2D *in_tex[2];
@@ -290,6 +293,8 @@ static void pk_bridge_destroy(struct pk_bridge *b)
         ID3D11VideoProcessor_Release(b->vp);
     if (b->vp_enum)
         ID3D11VideoProcessorEnumerator_Release(b->vp_enum);
+    if (b->video_ctx1)
+        ID3D11VideoContext1_Release(b->video_ctx1);
     if (b->video_ctx)
         ID3D11VideoContext_Release(b->video_ctx);
     if (b->video_dev)
@@ -309,6 +314,31 @@ static void pk_bridge_destroy(struct pk_bridge *b)
     if (b->proxy)
         FreeLibrary(b->proxy);
     talloc_free(b);
+}
+
+// Same fill-in the VO does (vf_d3d11vpp does it before deriving a DXGI colour space):
+// an untagged clip has repr.sys/levels unset, and guessing makes the filter, the bridge
+// and the VO agree on the matrix/range the pixels are really in.
+static void pk_guessed_params(const struct mp_image_params *in,
+                              struct mp_image_params *out)
+{
+    *out = *in;
+    mp_image_params_guess_csp(out);
+}
+
+// Matrix id as used by the bridge (AVColorSpace numbering, see vs-dlssg yuv.h).
+static int pk_matrix_from_params(const struct mp_image_params *par, int h)
+{
+    switch (par->repr.sys) {
+    case PL_COLOR_SYSTEM_BT_601:
+        // BT.601 splits into 470BG/SMPTE170M purely by resolution.
+        return h > 576 ? 6 : 5;
+    case PL_COLOR_SYSTEM_SMPTE_240M: return 7;
+    case PL_COLOR_SYSTEM_BT_2020_NC: return 9;
+    case PL_COLOR_SYSTEM_BT_2020_C:  return 10;
+    case PL_COLOR_SYSTEM_BT_709:     return 1;
+    default:                         return 1;
+    }
 }
 
 static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
@@ -529,10 +559,21 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
     MultiByteToWideChar(CP_UTF8, 0, abs_proxy_dir, -1, proxy_dir_w, MAX_PATH);
 
     char err[512] = {0};
+    // The bridge converts NV12/P010 <-> RGB with one fixed matrix/range pair, so it has
+    // to match the clip.  The options only override it: otherwise take the values the
+    // decoded frames carry (BT.709 limited when the container says nothing).
+    struct mp_image_params par;
+    pk_guessed_params(&img->params, &par);
+    int matrix = p->opts->matrix;
+    if (matrix <= 0)
+        matrix = pk_matrix_from_params(&par, img->h);
+    int full = p->opts->full_range ||
+               par.repr.levels == PL_COLOR_LEVELS_FULL;
+    MP_INFO(f, "playkit: bridge colours matrix=%d full=%d (sys=%d levels=%d)\n",
+            matrix, full, (int)par.repr.sys, (int)par.repr.levels);
     b->handle = b->create(adesc.AdapterLuid.LowPart,
                           (int32_t)adesc.AdapterLuid.HighPart,
-                          b->width, b->height, bits, p->opts->matrix,
-                          p->opts->full_range ? 1 : 0,
+                          b->width, b->height, bits, matrix, full ? 1 : 0,
                           proxy_dir_w[0] ? proxy_dir_w : NULL, err,
                           sizeof(err));
     if (!b->handle) {
@@ -573,16 +614,85 @@ static void pk_luma_stat(struct mp_filter *f, ID3D11Texture2D *tex, UINT sub,
                          int index, const char *what);
 
 // The video processor is never told what the pixels mean, so it falls back to its
-// defaults: full range RGB in, BT.601 full range YCbCr out.  The generated frames are
-// then tagged with the source parameters (BT.709 limited), which makes the VO expand
-// the range a second time - black crush and clipped whites on every generated frame.
+// defaults: full range RGB in, BT.601 limited range YCbCr out.  The generated frames
+// are then tagged with the source parameters, so the VO never sees the same encoding
+// as the real frames - black crush and clipped whites on every generated frame.
 // Match the output to the parameters the frame carries instead.
+//
+// The legacy D3D11_VIDEO_PROCESSOR_COLOR_SPACE.Nominal_Range is inert on the NVIDIA
+// driver for the output stage: measured byte-identical output with 0 (full) and 1
+// (studio), so a full range source still had its generated frames squeezed into
+// 16-235 while the real frames kept 0-250 - a brightness pulse at source rate.
+// ID3D11VideoContext1's DXGI colour space API does switch both range and matrix.
+static ID3D11VideoContext1 *pk_video_ctx1(struct pk_bridge *b)
+{
+    if (b->video_ctx1)
+        return b->video_ctx1;
+    ID3D11VideoContext1 *ctx1 = NULL;
+    if (FAILED(ID3D11VideoContext_QueryInterface(b->video_ctx,
+                                                 &IID_ID3D11VideoContext1,
+                                                 (void **)&ctx1)))
+        return NULL;
+    b->video_ctx1 = ctx1;
+    return ctx1;
+}
+
 static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
 {
     struct priv *p = f->priv;
     struct pk_bridge *b = p->bridge;
     if (!b || !b->video_ctx || !b->vp)
         return;
+
+    // 0 = BT.601, 1 = BT.709, 2 = BT.2020
+    int matrix = 1;
+    bool full = false;
+    if (ref) {
+        struct mp_image_params par;
+        pk_guessed_params(&ref->params, &par);
+        switch (par.repr.sys) {
+        case PL_COLOR_SYSTEM_BT_601:     matrix = 0; break;
+        case PL_COLOR_SYSTEM_BT_2020_NC:
+        case PL_COLOR_SYSTEM_BT_2020_C:  matrix = 2; break;
+        default:                         matrix = 1; break;
+        }
+        // Anything that is not explicitly full (auto/unknown included) is handled as
+        // studio range, which is what the container tags mean in practice.
+        full = par.repr.levels == PL_COLOR_LEVELS_FULL;
+    }
+    // Diagnostic override: PLAYKIT_OUTRANGE=full|limited.
+    const char *ov = getenv("PLAYKIT_OUTRANGE");
+    if (ov && !strcmp(ov, "full"))
+        full = true;
+    else if (ov && !strcmp(ov, "limited"))
+        full = false;
+
+    ID3D11VideoContext1 *ctx1 = getenv("PLAYKIT_LEGACY_CS") ? NULL
+                                                            : pk_video_ctx1(b);
+    if (ctx1) {
+        // The engine hands us full range RGB (RGBA8 shared texture, 0-255).
+        DXGI_COLOR_SPACE_TYPE in_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        DXGI_COLOR_SPACE_TYPE out_cs;
+        if (!full) {
+            out_cs = matrix == 0 ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601
+                   : matrix == 2 ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020
+                                 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+        } else {
+            out_cs = matrix == 0 ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601
+                   : matrix == 2 ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
+                                 : DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709;
+        }
+        ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(ctx1, b->vp, 0,
+                                                               in_cs);
+        ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(ctx1, b->vp,
+                                                               out_cs);
+        if (getenv("PLAYKIT_DSTSTAT") && !p->cs_logged) {
+            p->cs_logged = true;
+            MP_INFO(f, "playkit: colorspace cs1 in=0x%x out=0x%x\n",
+                    (unsigned)in_cs, (unsigned)out_cs);
+        }
+        return;
+    }
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {0};
     in.Usage = 0;              // playback
@@ -593,19 +703,19 @@ static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {0};
     out.Usage = 0;
     out.RGB_Range = 0;
-    out.YCbCr_Matrix = 1;      // BT.709 unless the source says otherwise
-    out.Nominal_Range = 1;     // studio range 16-235
-    if (ref) {
-        if (ref->params.repr.sys == PL_COLOR_SYSTEM_BT_601)
-            out.YCbCr_Matrix = 0;
-        if (ref->params.repr.levels == PL_COLOR_LEVELS_FULL)
-            out.Nominal_Range = 0;
-    }
+    out.YCbCr_Matrix = matrix == 0 ? 0 : 1;
+    out.Nominal_Range = full ? 0 : 1;
 
     ID3D11VideoContext_VideoProcessorSetStreamColorSpace(b->video_ctx, b->vp, 0,
                                                          &in);
     ID3D11VideoContext_VideoProcessorSetOutputColorSpace(b->video_ctx, b->vp,
                                                          &out);
+    if (getenv("PLAYKIT_DSTSTAT") && !p->cs_logged) {
+        p->cs_logged = true;
+        MP_INFO(f, "playkit: colorspace legacy in=%s/%d out=%s/%d\n",
+                in.YCbCr_Matrix ? "709" : "601", in.Nominal_Range,
+                out.YCbCr_Matrix ? "709" : "601", out.Nominal_Range);
+    }
 }
 
 static bool pk_generate(struct mp_filter *f, struct mp_image *prev,
@@ -736,13 +846,18 @@ static void pk_luma_stat(struct mp_filter *f, ID3D11Texture2D *tex, UINT sub,
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(ID3D11DeviceContext_Map(b->ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &map))) {
+        // D3D11 hw frames are R8 (NV12) or R16 (P010) luma planes; report 10-bit
+        // samples scaled to the same 0-255 range so both depths are comparable.
+        const bool wide = d.Format == DXGI_FORMAT_P010 ||
+                          d.Format == DXGI_FORMAT_R16_UNORM ||
+                          d.Format == DXGI_FORMAT_R16_TYPELESS;
         unsigned long long sum = 0;
         unsigned mn = 255, mx = 0;
         for (UINT y = 0; y < d.Height; y++) {
             const uint8_t *row =
                 (const uint8_t *)map.pData + (size_t)y * map.RowPitch;
             for (UINT x = 0; x < d.Width; x++) {
-                unsigned v = row[x];
+                unsigned v = wide ? (((const uint16_t *)row)[x] >> 8) : row[x];
                 sum += v;
                 if (v < mn)
                     mn = v;
