@@ -230,6 +230,20 @@ struct pk_bridge {
     int subfmt;
     int width;
     int height;
+    /* BT.2020 的两段式回退：先把全范围 RGB 压到 studio 范围（RGB→RGB），
+     * 再按 P2020 输出。仅当驱动不认 P2020 输出的 studio 范围时启用。 */
+    bool two_pass;
+    bool pq;
+    /* 中间纹理用 YUV（P010/NV12）而不是 RGBA：第二段就变成纯色矩阵转换，
+     * 绕开驱动对 RGB→P2020 的坏路径（实验开关 PLAYKIT_2PASS=yuv）。 */
+    bool mid_yuv;
+    /* BT.2020: the engine writes the YCbCr planes into the shared output
+     * texture itself (the driver's P2020 video-processor output is broken), so
+     * generated frames are plain copies. */
+    bool yuv_out;
+    ID3D11Texture2D *mid_tex;
+    ID3D11VideoProcessorInputView *mid_in;
+    ID3D11VideoProcessorOutputView *mid_out;
 };
 
 static HANDLE pk_share_handle(ID3D11Texture2D *tex)
@@ -508,6 +522,21 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
     b->subfmt = img->params.hw_subfmt;
     b->width = img->w;
     b->height = img->h;
+
+    /* Work out the colours of the decoded frames before anything is allocated:
+     * the shared output texture's format depends on the matrix. */
+    struct mp_image_params par;
+    pk_guessed_params(&img->params, &par);
+    int matrix = p->opts->matrix;
+    if (matrix <= 0)
+        matrix = pk_matrix_from_params(&par, img->h);
+    int full = p->opts->full_range ||
+               par.repr.levels == PL_COLOR_LEVELS_FULL;
+    /* BT.2020 goes through the engine's own YCbCr output: the video processor
+     * on this driver neither applies the studio range nor keeps neutral chroma
+     * neutral for P2020 output, which is what made generated frames flicker. */
+    b->yuv_out = (matrix == 9 || matrix == 10) && !getenv("PLAYKIT_NOYUV");
+
     const int out_count = MPCLAMP(p->opts->multi - 1, 1, PK_MAX_OUT);
 
     /* 流水深度：pipe 选项优先，默认两对同时在引擎里（一组 4K 槽位约 160MB）。 */
@@ -537,11 +566,15 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
                 goto fail;
         }
         for (int i = 0; i < out_count; i++) {
+            /* BT.2020: P010/NV12 written by the engine; RGBA8 otherwise. */
+            const DXGI_FORMAT out_fmt = b->yuv_out ? dxgi_fmt
+                                                   : DXGI_FORMAT_R8G8B8A8_UNORM;
+            UINT out_bind = D3D11_BIND_RENDER_TARGET |
+                            D3D11_BIND_SHADER_RESOURCE;
+            if (!b->yuv_out)
+                out_bind |= D3D11_BIND_UNORDERED_ACCESS;
             sl->out_tex[i] = pk_create_tex(b->dev, b->width, b->height,
-                                           DXGI_FORMAT_R8G8B8A8_UNORM,
-                                           D3D11_BIND_RENDER_TARGET |
-                                           D3D11_BIND_UNORDERED_ACCESS |
-                                           D3D11_BIND_SHADER_RESOURCE);
+                                           out_fmt, out_bind);
             if (!sl->out_tex[i])
                 goto fail;
             sl->out_handle[i] = pk_share_handle(sl->out_tex[i]);
@@ -652,15 +685,7 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
 
     char err[512] = {0};
     // The bridge converts NV12/P010 <-> RGB with one fixed matrix/range pair, so it has
-    // to match the clip.  The options only override it: otherwise take the values the
-    // decoded frames carry (BT.709 limited when the container says nothing).
-    struct mp_image_params par;
-    pk_guessed_params(&img->params, &par);
-    int matrix = p->opts->matrix;
-    if (matrix <= 0)
-        matrix = pk_matrix_from_params(&par, img->h);
-    int full = p->opts->full_range ||
-               par.repr.levels == PL_COLOR_LEVELS_FULL;
+    // to match the clip (resolved above, before the output textures were created).
     MP_INFO(f, "playkit: bridge colours matrix=%d full=%d (sys=%d levels=%d)\n",
             matrix, full, (int)par.repr.sys, (int)par.repr.levels);
     b->handle = b->create(adesc.AdapterLuid.LowPart,
@@ -677,6 +702,9 @@ static bool pk_bridge_init(struct mp_filter *f, struct mp_image *img)
     MP_INFO(f, "playkit: vdlssg bridge ready %dx%d %s bits=%d multi=%d pipe=%d\n",
             b->width, b->height, mp_imgfmt_to_name(b->subfmt), bits,
             p->opts->multi, b->slot_count);
+    MP_INFO(f, "playkit: generated frames %s\n",
+            b->yuv_out ? "come from the engine as YCbCr"
+                       : "go through the video processor as RGBA8");
     return true;
 
 fail:
@@ -908,6 +936,17 @@ static ID3D11VideoContext1 *pk_video_ctx1(struct pk_bridge *b)
     return ctx1;
 }
 
+static void pk_env_cs(const char *name, DXGI_COLOR_SPACE_TYPE *cs)
+{
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return;
+    char *end = NULL;
+    long n = strtol(v, &end, 0);
+    if (end && end != v)
+        *cs = (DXGI_COLOR_SPACE_TYPE)n;
+}
+
 static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
 {
     struct priv *p = f->priv;
@@ -918,6 +957,7 @@ static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
     // 0 = BT.601, 1 = BT.709, 2 = BT.2020
     int matrix = 1;
     bool full = false;
+    bool pq = false;
     if (ref) {
         struct mp_image_params par;
         pk_guessed_params(&ref->params, &par);
@@ -927,10 +967,19 @@ static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
         case PL_COLOR_SYSTEM_BT_2020_C:  matrix = 2; break;
         default:                         matrix = 1; break;
         }
+        // The engine converts with the source matrix but leaves the transfer function
+        // alone, so the RGB it hands back still holds PQ-encoded code values for HDR10.
+        pq = par.color.transfer == PL_COLOR_TRC_PQ;
         // Anything that is not explicitly full (auto/unknown included) is handled as
         // studio range, which is what the container tags mean in practice.
         full = par.repr.levels == PL_COLOR_LEVELS_FULL;
     }
+    b->pq = pq;
+    // BT.2020 走两段式：驱动对 P2020 的 YCbCr 输出不做 studio 范围压缩，
+    // 单段会把 limited 源渲染成 full（16→0、215→231），生成帧因此比源帧亮一截。
+    b->two_pass = matrix == 2 && !full && !getenv("PLAYKIT_1PASS");
+    const char *mode = getenv("PLAYKIT_2PASS");
+    b->mid_yuv = mode && !strcmp(mode, "yuv");
     // Diagnostic override: PLAYKIT_OUTRANGE=full|limited.
     const char *ov = getenv("PLAYKIT_OUTRANGE");
     if (ov && !strcmp(ov, "full"))
@@ -941,26 +990,69 @@ static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
     ID3D11VideoContext1 *ctx1 = getenv("PLAYKIT_LEGACY_CS") ? NULL
                                                             : pk_video_ctx1(b);
     if (ctx1) {
-        // The engine hands us full range RGB (RGBA8 shared texture, 0-255).
-        DXGI_COLOR_SPACE_TYPE in_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        // The engine hands us full range RGB (RGBA8 shared texture, 0-255) in the
+        // source's own colour space. The input side must name the *same* primaries as
+        // the output side: when they differ the video processor gamut-converts the
+        // (non-linear) code values, which for BT.2020 sources shows up as a contrast
+        // stretch (black crushed, white clipped) and makes generated frames pulse
+        // against the real ones. DXGI has no full range PQ YCbCr type, so full range
+        // HDR stays on the G22 pair and only the matrix/range get applied.
+        const bool use_pq = pq && !full;
+        DXGI_COLOR_SPACE_TYPE in_cs;
         DXGI_COLOR_SPACE_TYPE out_cs;
-        if (!full) {
-            out_cs = matrix == 0 ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601
-                   : matrix == 2 ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020
-                                 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
-        } else {
-            out_cs = matrix == 0 ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601
-                   : matrix == 2 ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
-                                 : DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709;
+        switch (matrix) {
+        case 0:
+            in_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            out_cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601
+                          : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
+            break;
+        case 2:
+            in_cs = use_pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                           : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+            out_cs = use_pq ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020
+                   : full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
+                          : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+            break;
+        default:
+            in_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            out_cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+                          : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            break;
         }
+        // Diagnostic overrides, both hex: PLAYKIT_INCS / PLAYKIT_OUTCS.
+        pk_env_cs("PLAYKIT_INCS", &in_cs);
+        pk_env_cs("PLAYKIT_OUTCS", &out_cs);
         ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(ctx1, b->vp, 0,
                                                                in_cs);
         ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(ctx1, b->vp,
                                                                out_cs);
         if (getenv("PLAYKIT_DSTSTAT") && !p->cs_logged) {
             p->cs_logged = true;
-            MP_INFO(f, "playkit: colorspace cs1 in=0x%x out=0x%x\n",
-                    (unsigned)in_cs, (unsigned)out_cs);
+            DXGI_COLOR_SPACE_TYPE got = (DXGI_COLOR_SPACE_TYPE)-1;
+            ID3D11VideoContext1_VideoProcessorGetOutputColorSpace1(ctx1, b->vp,
+                                                                  &got);
+            MP_INFO(f, "playkit: colorspace cs1 in=0x%x out=0x%x readback=0x%x\n",
+                    (unsigned)in_cs, (unsigned)out_cs, (unsigned)got);
+            // Which output spaces does the driver accept for this format pair?
+            ID3D11VideoProcessorEnumerator1 *e1 = NULL;
+            if (SUCCEEDED(ID3D11VideoProcessorEnumerator_QueryInterface(
+                    b->vp_enum, &IID_ID3D11VideoProcessorEnumerator1,
+                    (void **)&e1)) && e1) {
+                static const DXGI_COLOR_SPACE_TYPE cand[] = {
+                    0xa, 0xf, 0xd, 0x10, 0xb, 0x9,
+                };
+                for (int i = 0; i < (int)MP_ARRAY_SIZE(cand); i++) {
+                    WINBOOL ok = 0;
+                    HRESULT hr = ID3D11VideoProcessorEnumerator1_CheckVideoProcessorFormatConversion(
+                        e1, DXGI_FORMAT_R8G8B8A8_UNORM, in_cs,
+                        b->subfmt == IMGFMT_D3D11 ? DXGI_FORMAT_P010
+                                                  : DXGI_FORMAT_NV12,
+                        cand[i], &ok);
+                    MP_INFO(f, "playkit: cs support out=0x%x ok=%d hr=0x%lx\n",
+                            (unsigned)cand[i], ok ? 1 : 0, (unsigned long)hr);
+                }
+                ID3D11VideoProcessorEnumerator1_Release(e1);
+            }
         }
         return;
     }
@@ -968,7 +1060,7 @@ static void pk_update_colorspace(struct mp_filter *f, struct mp_image *ref)
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {0};
     in.Usage = 0;              // playback
     in.RGB_Range = 0;          // the engine outputs full range RGBA
-    in.YCbCr_Matrix = 1;       // BT.709 primaries
+    in.YCbCr_Matrix = matrix == 0 ? 0 : 1;   // the legacy struct cannot express BT.2020
     in.Nominal_Range = 0;      // 0-255
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {0};
@@ -1249,6 +1341,32 @@ static void pk_luma_stat(struct mp_filter *f, ID3D11Texture2D *tex, UINT sub,
         }
         MP_INFO(f, "playkit: %s[%d] sub=%u y=%.2f min=%u max=%u\n", what,
                 index, sub, (double)sum / ((double)d.Width * d.Height), mn, mx);
+        // Chroma lives in the second plane of the same surface: for NV12/P010 the
+        // driver lays plane 1 right after plane 0 (Height rows of RowPitch), at
+        // half resolution. A wrong matrix or transfer function in the video
+        // processor leaves luma right while Cb/Cr drift, which shows as a green
+        // or magenta tint on generated frames only.
+        if (d.Format == DXGI_FORMAT_P010 || d.Format == DXGI_FORMAT_NV12) {
+            const bool wide = d.Format == DXGI_FORMAT_P010;
+            const UINT cw = d.Width / 2, ch = d.Height / 2;
+            const uint8_t *base =
+                (const uint8_t *)map.pData + (size_t)map.RowPitch * d.Height;
+            unsigned long long us = 0, vs = 0;
+            for (UINT y = 0; y < ch; y++) {
+                const uint8_t *row = base + (size_t)y * map.RowPitch;
+                for (UINT x = 0; x < cw; x++) {
+                    // P010 packs U low / V high in one 32-bit word; NV12 is a
+                    // plain U,V byte pair.
+                    const uint16_t *w = (const uint16_t *)row;
+                    unsigned u = wide ? (w[2 * x] >> 8) : row[2 * x];
+                    unsigned v = wide ? (w[2 * x + 1] >> 8) : row[2 * x + 1];
+                    us += u;
+                    vs += v;
+                }
+            }
+            MP_INFO(f, "playkit: %s[%d] cb=%.2f cr=%.2f\n", what, index,
+                    (double)us / ((double)cw * ch), (double)vs / ((double)cw * ch));
+        }
         ID3D11DeviceContext_Unmap(b->ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
@@ -1290,6 +1408,60 @@ static void pk_dump_rgba(struct pk_bridge *b, ID3D11Texture2D *tex,
         ID3D11DeviceContext_Unmap(b->ctx, (ID3D11Resource *)staging, 0);
     }
     ID3D11Texture2D_Release(staging);
+}
+
+static void pk_set_cs(struct pk_bridge *b, DXGI_COLOR_SPACE_TYPE in,
+                      DXGI_COLOR_SPACE_TYPE out)
+{
+    if (!b->video_ctx1 || !b->vp)
+        return;
+    ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(b->video_ctx1,
+                                                           b->vp, 0, in);
+    ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(b->video_ctx1,
+                                                           b->vp, out);
+}
+
+/* 两段式回退用的中间 RGBA 纹理与视图，懒创建。 */
+static bool pk_two_pass_init(struct mp_filter *f, struct pk_bridge *b)
+{
+    if (b->mid_tex)
+        return true;
+    D3D11_TEXTURE2D_DESC td = {
+        .Width = b->width,
+        .Height = b->height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = b->mid_yuv ? (b->subfmt == IMGFMT_P010 ? DXGI_FORMAT_P010
+                                                        : DXGI_FORMAT_NV12)
+                             : DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { .Count = 1 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+    };
+    HRESULT hr = ID3D11Device_CreateTexture2D(b->dev, &td, NULL, &b->mid_tex);
+    if (FAILED(hr)) {
+        MP_ERR(f, "playkit: mid texture failed 0x%lx\n", (unsigned long)hr);
+        b->mid_tex = NULL;
+        return false;
+    }
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {
+        .FourCC = 0,
+        .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D,
+    };
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {0};
+    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(
+        b->video_dev, (ID3D11Resource *)b->mid_tex, b->vp_enum, &ivd,
+        &b->mid_in);
+    if (SUCCEEDED(hr))
+        hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(
+            b->video_dev, (ID3D11Resource *)b->mid_tex, b->vp_enum, &ovd,
+            &b->mid_out);
+    if (FAILED(hr)) {
+        MP_ERR(f, "playkit: mid views failed 0x%lx\n", (unsigned long)hr);
+        return false;
+    }
+    return true;
 }
 
 static struct mp_image *pk_frame(struct mp_filter *f, struct pk_slot *s,
@@ -1336,6 +1508,31 @@ static struct mp_image *pk_frame(struct mp_filter *f, struct pk_slot *s,
         .FourCC = 0,
         .ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D,
     };
+    if (b->yuv_out) {
+        /* The engine already wrote a finished P010/NV12 frame: hand it over
+         * unchanged, which is also exact (no converter in the way). */
+        ID3D11DeviceContext_CopySubresourceRegion(
+            b->ctx, (ID3D11Resource *)dst, dst_sub, 0, 0, 0,
+            (ID3D11Resource *)s->out_tex[index], 0, NULL);
+        const double pt2 = pk_now_ms();
+        if (getenv("PLAYKIT_TRACE"))
+            MP_INFO(f, "playkit: trace copy k=%d copy=%.2f\n", index, pt2 - pt1);
+        if (getenv("PLAYKIT_DSTSTAT"))
+            pk_luma_stat(f, dst, dst_sub, index, "dst");
+        if (p->opts->log) {
+            uint64_t hash = pk_hash_texture(b, dst, dst_sub);
+            MP_INFO(f, "playkit: out[%d] hash=%016llx\n", index,
+                    (unsigned long long)hash);
+        }
+        struct mp_image *img = mp_image_from_av_frame(av);
+        av_frame_free(&av);
+        if (!img)
+            return NULL;
+        img->pts = pts;
+        img->nominal_fps = nominal_fps;
+        return img;
+    }
+
     ID3D11VideoProcessorInputView *in_view = s->in_view[index];
     HRESULT hr = S_OK;
     if (!in_view) {
@@ -1394,8 +1591,46 @@ static struct mp_image *pk_frame(struct mp_filter *f, struct pk_slot *s,
         .InputFrameOrField = 0,
         .pInputSurface = in_view,
     };
-    hr = ID3D11VideoContext_VideoProcessorBlt(
-        b->video_ctx, b->vp, out_view, 0, 1, &stream);
+    if (b->two_pass && pk_two_pass_init(f, b)) {
+        if (b->mid_yuv) {
+            // 实验路径：RGB → 709 的 YCbCr（该组合范围与色度都正确），
+            // 再把 709 YUV 矩阵转换成 P2020 YUV。
+            pk_set_cs(b, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                      DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+        } else {
+            // 驱动对 BT.2020 的 YCbCr 输出不做 studio 范围压缩，先单独把全范围
+            // RGB 压到 studio 范围，再按 P2020 输出（此时是原样搬码值）。
+            pk_set_cs(b, b->pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                               : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020,
+                      b->pq ? DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
+                            : DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P2020);
+        }
+        hr = ID3D11VideoContext_VideoProcessorBlt(b->video_ctx, b->vp,
+                                                  b->mid_out, 0, 1, &stream);
+        if (SUCCEEDED(hr)) {
+            DXGI_COLOR_SPACE_TYPE out2 =
+                b->pq ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020
+                      : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+            /* 诊断：PLAYKIT_PASS2_OUT 直接覆盖第二段输出，用于验证矩阵转换是否发生。 */
+            pk_env_cs("PLAYKIT_PASS2_OUT", &out2);
+            pk_set_cs(b, b->mid_yuv
+                            ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
+                            : (b->pq ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                                     : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020),
+                      out2);
+            D3D11_VIDEO_PROCESSOR_STREAM s2 = {
+                .Enable = TRUE,
+                .OutputIndex = 0,
+                .InputFrameOrField = 0,
+                .pInputSurface = b->mid_in,
+            };
+            hr = ID3D11VideoContext_VideoProcessorBlt(b->video_ctx, b->vp,
+                                                      out_view, 0, 1, &s2);
+        }
+    } else {
+        hr = ID3D11VideoContext_VideoProcessorBlt(
+            b->video_ctx, b->vp, out_view, 0, 1, &stream);
+    }
     if (!out_view_cached)
         ID3D11VideoProcessorOutputView_Release(out_view);
     const double pt2 = pk_now_ms();
