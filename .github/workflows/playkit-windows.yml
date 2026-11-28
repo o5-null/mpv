@@ -12,6 +12,16 @@ name: playkit-windows
 #   - manual run
 #   - any push to master: auto build, artifact only (no release)
 #   - push a tag like playkit-2026.11.23: build + release
+#   - daily schedule (06:00 UTC): build + refresh the single rolling release
+#
+# Release policy: one rolling release tagged `playkit-nightly` (prerelease)
+# whose one asset `mpv-x86_64-playkit-nightly.zip` is replaced every day, so
+# the release list does not grow by one 75 MB entry per day. Stable releases
+# are still made by pushing a `playkit-*` tag.
+#
+# Note: GitHub disables scheduled workflows in forks of public repositories by
+# default. If the daily run stops showing up, open Actions -> the workflow ->
+# "Enable workflow" (it can also be auto-disabled after 60 quiet days).
 
 on:
   workflow_dispatch:
@@ -20,11 +30,19 @@ on:
         description: "Version string for the archive name (default: today, YYYY.MM.DD)"
         required: false
         default: ""
+      rolling:
+        description: "Publish the rolling nightly release from this run"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - master
     tags:
       - "playkit-*"
+  schedule:
+    # 06:00 UTC = 14:00 Beijing. Schedules only run from the default branch.
+    - cron: "0 6 * * *"
 
 permissions:
   contents: write
@@ -129,6 +147,10 @@ jobs:
             --msys-bin "$(cygpath -w /clang64/bin)" \
             --out "dist/mpv-x86_64-playkit-${VERSION}.zip" \
             --version "${VERSION}"
+          # The rolling release keeps one fixed asset name so each day's build
+          # replaces it instead of piling up 75 MB files.
+          cp "dist/mpv-x86_64-playkit-${VERSION}.zip" \
+             "dist/mpv-x86_64-playkit-nightly.zip"
           ls -l dist
 
       - name: Upload artifact
@@ -152,3 +174,25 @@ jobs:
             Unlike shinchiro's static mpv-winbuild, this is the MSYS2 CLANG64
             dynamic build with its DLL closure flattened into the archive root:
             unzip and run `mpv.exe` / `mpv.com`, no MSYS2 installation needed.
+
+      # Daily build goes to the same release every time: one entry in the
+      # release list, one asset replaced, no notification per commit.
+      - name: Refresh rolling release (daily)
+        if: github.event_name == 'schedule' || inputs.rolling
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: playkit-nightly
+          name: PlayKit nightly (rolling)
+          prerelease: true
+          overwrite_files: true
+          files: dist/mpv-x86_64-playkit-nightly.zip
+          body: |
+            Rolling build of the fork's master branch, refreshed daily (06:00
+            UTC) and on demand.
+
+            `mpv-x86_64-playkit-nightly.zip` always holds the newest build;
+            its name does not change, so the download link stays valid.
+            The build stamp is in `mpv --version`.
+
+            Previous rolling builds are not kept - use the `playkit-*` tags for
+            a fixed version.
